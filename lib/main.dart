@@ -624,11 +624,11 @@ class _HomeScreenState extends State<HomeScreen> {
   void _openAddTaskModal() {
     showModalBottomSheet(
       context: context,
-      isScrollElevationEnabled: true,
       isScrollControlled: true,
       builder: (ctx) => AddTaskSheet(onTaskAdded: _refresh),
     );
   }
+
 
   Future<void> _exportCSV() async {
     final tasks = await AppDatabase.getTasks(showCompleted: true);
