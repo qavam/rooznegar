@@ -19,13 +19,26 @@ class NotificationService {
 
   static Future<void> init() async {
     tz.initializeTimeZones();
-    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
-    const initSettings = InitializationSettings(android: androidSettings);
-    await _notifications.initialize(initSettings);
+    // ✅ اصلاح: تعیین منطقه زمانی محلی (تهران) تا آلارم‌ها در ساعت درست فعال شوند
+    try {
+      final tehran = tz.getLocation('Asia/Tehran');
+      tz.setLocalLocation(tehran);
+    } catch (_) {
+      // اگر داده timezone بارگذاری نشد، UTC به‌صورت پیش‌فرض باقی می‌ماند
+    }
 
-    // درخواست دسترسی در اندروید ۱۳ به بعد
+    const androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const initSettings = InitializationSettings(android: androidSettings);
+    await _notifications.initialize(
+      initSettings,
+      onDidReceiveNotificationResponse: (_) {},
+    );
+
+    // درخواست دسترسی اعلان‌ها در اندروید ۱۳ به بعد
     await _notifications
-        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
         ?.requestNotificationsPermission();
   }
 
@@ -36,7 +49,6 @@ class NotificationService {
     required DateTime scheduledDate,
   }) async {
     if (scheduledDate.isBefore(DateTime.now())) return;
-
     final tzDateTime = tz.TZDateTime.from(scheduledDate, tz.local);
     await _notifications.zonedSchedule(
       id,
@@ -100,14 +112,14 @@ class Task {
       };
 
   factory Task.fromMap(Map<String, dynamic> map) => Task(
-        id: map['id'],
-        title: map['title'],
-        category: map['category'],
-        dueDate: map['due_date'],
-        dueTime: map['due_time'],
-        priority: map['priority'],
-        recurrence: map['recurrence'],
-        isCompleted: map['is_completed'] == 1,
+        id: map['id'] as int?,
+        title: map['title'] as String,
+        category: map['category'] as String,
+        dueDate: map['due_date'] as String,
+        dueTime: map['due_time'] as String,
+        priority: map['priority'] as String,
+        recurrence: map['recurrence'] as String,
+        isCompleted: (map['is_completed'] as int) == 1,
       );
 }
 
@@ -128,18 +140,18 @@ class AppDatabase {
       version: 1,
       onCreate: (db, version) async {
         await db.execute('''
-          CREATE TABLE tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            category TEXT NOT NULL,
-            due_date TEXT NOT NULL,
-            due_time TEXT NOT NULL,
-            priority TEXT NOT NULL,
-            recurrence TEXT NOT NULL,
-            is_completed INTEGER DEFAULT 0,
-            completed_at TEXT
-          )
-        ''');
+CREATE TABLE tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  due_time TEXT NOT NULL,
+  priority TEXT NOT NULL,
+  recurrence TEXT NOT NULL,
+  is_completed INTEGER DEFAULT 0,
+  completed_at TEXT
+)
+''');
       },
     );
   }
@@ -157,18 +169,15 @@ class AppDatabase {
   }) async {
     final db = await instance;
     String where = showCompleted ? '1=1' : 'is_completed = 0';
-    List<dynamic> args = [];
-
+    List<String> args = [];
     if (query.isNotEmpty) {
       where += ' AND (title LIKE ? OR category LIKE ?)';
       args.addAll(['%$query%', '%$query%']);
     }
-
     if (category != 'همه') {
       where += ' AND category = ?';
       args.add(category);
     }
-
     final todayStr = DateTime.now().toIso8601String().substring(0, 10);
     if (period == 'امروز') {
       where += ' AND due_date = ?';
@@ -177,9 +186,12 @@ class AppDatabase {
       where += ' AND due_date < ? AND is_completed = 0';
       args.add(todayStr);
     }
-
-    final result = await db.query('tasks',
-        where: where, whereArgs: args, orderBy: 'is_completed ASC, due_date ASC, due_time ASC');
+    final result = await db.query(
+      'tasks',
+      where: where,
+      whereArgs: args,
+      orderBy: 'is_completed ASC, due_date ASC, due_time ASC',
+    );
     return result.map((e) => Task.fromMap(e)).toList();
   }
 
@@ -191,19 +203,18 @@ class AppDatabase {
       where: 'id = ?',
       whereArgs: [task.id],
     );
-
     // تکرار خودکار
     if (task.recurrence != 'بدون تکرار') {
-      DateTime current = DateTime.parse(task.dueDate);
+      final DateTime current = DateTime.parse(task.dueDate);
       DateTime next;
       if (task.recurrence == 'روزانه') {
         next = current.add(const Duration(days: 1));
       } else if (task.recurrence == 'هفتگی') {
         next = current.add(const Duration(days: 7));
       } else {
-        next = DateTime(current.year, current.month + 1, current.day);
+        // ✅ اصلاح: تکرار ماهانه بدون سرریز در پایان سال و روزهای ۲۹/۳۰/۳۱
+        next = _addOneMonthSafe(current);
       }
-
       await insertTask(Task(
         title: task.title,
         category: task.category,
@@ -215,6 +226,22 @@ class AppDatabase {
     }
   }
 
+  /// ماه بعد را به‌صورت امن محاسبه می‌کند؛ اگر روز فعلی در ماه بعد وجود نداشت،
+  /// به آخرین روزِ آن ماه می‌رود (مثلاً ۳۱ فروردین → ۳۱ اردیبهشت نیست، ۳۰ اردیبهشت).
+  static DateTime _addOneMonthSafe(DateTime d) {
+    int newMonth = d.month + 1;
+    int newYear = d.year;
+    if (newMonth > 12) {
+      newMonth = 1;
+      newYear += 1;
+    }
+    // پیدا کردن آخرین روزِ ماه مقصد
+    final firstOfNext = DateTime(newYear, newMonth, 1);
+    final lastDayOfMonth = firstOfNext.subtract(const Duration(days: 1)).day;
+    final day = d.day < lastDayOfMonth ? d.day : lastDayOfMonth;
+    return DateTime(newYear, newMonth, day);
+  }
+
   static Future<void> deleteTask(int id) async {
     final db = await instance;
     await db.delete('tasks', where: 'id = ?', whereArgs: [id]);
@@ -224,7 +251,6 @@ class AppDatabase {
   static Future<Map<String, int>> getStats() async {
     final db = await instance;
     final todayStr = DateTime.now().toIso8601String().substring(0, 10);
-
     final pending = Sqflite.firstIntValue(
             await db.rawQuery('SELECT COUNT(*) FROM tasks WHERE is_completed = 0')) ??
         0;
@@ -239,7 +265,6 @@ class AppDatabase {
             'SELECT COUNT(*) FROM tasks WHERE due_date = ? AND is_completed = 1',
             [todayStr])) ??
         0;
-
     return {
       'pending': pending,
       'overdue': overdue,
@@ -370,7 +395,12 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   List<Task> _tasks = [];
-  Map<String, int> _stats = {'pending': 0, 'overdue': 0, 'todayTotal': 0, 'todayDone': 0};
+  Map<String, int> _stats = {
+    'pending': 0,
+    'overdue': 0,
+    'todayTotal': 0,
+    'todayDone': 0
+  };
   String _searchQuery = '';
   String _selectedCategory = 'همه';
   String _selectedPeriod = 'همه';
@@ -390,6 +420,7 @@ class _HomeScreenState extends State<HomeScreen> {
       showCompleted: _showCompleted,
     );
     final stats = await AppDatabase.getStats();
+    if (!mounted) return;
     setState(() {
       _tasks = tasks;
       _stats = stats;
@@ -413,19 +444,22 @@ class _HomeScreenState extends State<HomeScreen> {
     final todayTotal = _stats['todayTotal'] ?? 0;
     final todayDone = _stats['todayDone'] ?? 0;
     final progress = todayTotal > 0 ? (todayDone / todayTotal) : 0.0;
-
     return Scaffold(
       appBar: AppBar(
-        title: const Text('روزنگار', style: TextStyle(fontWeight: FontWeight.w900)),
+        title:
+            const Text('روزنگار', style: TextStyle(fontWeight: FontWeight.w900)),
         centerTitle: false,
         actions: [
           PopupMenuButton<String>(
             icon: const Icon(Icons.palette_outlined),
             onSelected: widget.onThemeChanged,
             itemBuilder: (context) => [
-              const PopupMenuItem(value: 'atelier', child: Text('آتلیه آرام (پیش‌فرض)')),
-              const PopupMenuItem(value: 'paper', child: Text('کاغذ روشن (Paper)')),
-              const PopupMenuItem(value: 'signal', child: Text('سیگنال نئونی (Signal)')),
+              const PopupMenuItem(
+                  value: 'atelier', child: Text('آتلیه آرام (پیش‌فرض)')),
+              const PopupMenuItem(
+                  value: 'paper', child: Text('کاغذ روشن (Paper)')),
+              const PopupMenuItem(
+                  value: 'signal', child: Text('سیگنال نئونی (Signal)')),
             ],
           ),
           IconButton(
@@ -444,7 +478,7 @@ class _HomeScreenState extends State<HomeScreen> {
             decoration: BoxDecoration(
               color: theme.cardColor,
               borderRadius: BorderRadius.circular(18),
-              border: Border.all(color: theme.dividerColor.withOpacity(0.1)),
+              border: Border.all(color: theme.dividerColor.withValues(alpha: 0.1)),
             ),
             child: Row(
               children: [
@@ -456,8 +490,10 @@ class _HomeScreenState extends State<HomeScreen> {
                           style: TextStyle(fontSize: 13, color: Colors.grey)),
                       const SizedBox(height: 6),
                       Text(
-                        _toPersianDigits('$todayDone از $todayTotal کار تکمیل شد'),
-                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                        _toPersianDigits(
+                            '$todayDone از $todayTotal کار تکمیل شد'),
+                        style: const TextStyle(
+                            fontSize: 17, fontWeight: FontWeight.bold),
                       ),
                       const SizedBox(height: 10),
                       ClipRRect(
@@ -465,7 +501,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         child: LinearProgressIndicator(
                           value: progress,
                           minHeight: 8,
-                          backgroundColor: theme.dividerColor.withOpacity(0.1),
+                          backgroundColor:
+                              theme.dividerColor.withValues(alpha: 0.1),
                           color: theme.colorScheme.secondary,
                         ),
                       ),
@@ -484,7 +521,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-
           // جستجو و فیلترها
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -495,7 +531,8 @@ class _HomeScreenState extends State<HomeScreen> {
                     decoration: InputDecoration(
                       hintText: 'جستجوی کارها...',
                       prefixIcon: const Icon(Icons.search, size: 20),
-                      contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                      contentPadding:
+                          const EdgeInsets.symmetric(vertical: 10),
                       filled: true,
                       fillColor: theme.cardColor,
                       border: OutlineInputBorder(
@@ -514,19 +551,19 @@ class _HomeScreenState extends State<HomeScreen> {
                   value: _selectedPeriod,
                   underline: const SizedBox(),
                   items: ['همه', 'امروز', 'عقب‌افتاده‌ها']
-                      .map((e) => DropdownMenuItem(value: e, child: Text(e)))
+                      .map((e) =>
+                          DropdownMenuItem(value: e, child: Text(e)))
                       .toList(),
                   onChanged: (v) {
-                    setState(() => _selectedPeriod = v!);
+                    if (v == null) return;
+                    setState(() => _selectedPeriod = v);
                     _refresh();
                   },
                 ),
               ],
             ),
           ),
-
           const SizedBox(height: 8),
-
           // لیست تسک‌ها
           Expanded(
             child: _tasks.isEmpty
@@ -540,13 +577,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     itemBuilder: (context, i) {
                       final task = _tasks[i];
                       return Dismissible(
-                        key: Key(task.id.toString()),
+                        key: ValueKey(task.id),
                         direction: DismissDirection.endToStart,
                         background: Container(
                           alignment: Alignment.centerLeft,
                           padding: const EdgeInsets.only(left: 20),
                           color: Colors.redAccent,
-                          child: const Icon(Icons.delete, color: Colors.white),
+                          child: const Icon(Icons.delete,
+                              color: Colors.white),
                         ),
                         onDismissed: (_) async {
                           await AppDatabase.deleteTask(task.id!);
@@ -559,7 +597,8 @@ class _HomeScreenState extends State<HomeScreen> {
                             color: theme.cardColor,
                             borderRadius: BorderRadius.circular(14),
                             border: Border.all(
-                                color: theme.dividerColor.withOpacity(0.08)),
+                                color: theme.dividerColor
+                                    .withValues(alpha: 0.08)),
                           ),
                           child: Row(
                             children: [
@@ -579,7 +618,8 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                               Expanded(
                                 child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.start,
                                   children: [
                                     Text(
                                       task.title,
@@ -599,7 +639,8 @@ class _HomeScreenState extends State<HomeScreen> {
                                       _toPersianDigits(
                                           '${task.category}  •  ${_formatJalali(task.dueDate)} ساعت ${task.dueTime}'),
                                       style: const TextStyle(
-                                          fontSize: 11, color: Colors.grey),
+                                          fontSize: 11,
+                                          color: Colors.grey),
                                     ),
                                   ],
                                 ),
@@ -629,18 +670,19 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-
   Future<void> _exportCSV() async {
     final tasks = await AppDatabase.getTasks(showCompleted: true);
     if (tasks.isEmpty) return;
-
     final buffer = StringBuffer();
+    // ✅ اصلاح: افزودن BOM برای نمایش صحیح فارسی در اکسل + کوتیشن فیلدها
+    buffer.write('\uFEFF');
     buffer.writeln('عنوان,دسته‌بندی,تاریخ شمسی,ساعت,اولویت,تکرار');
     for (var t in tasks) {
+      // کوتیشن‌گذاری فیلدها برای جلوگیری از شکست CSV در صورت وجود کاما
+      String q(String s) => '"${s.replaceAll('"', '""')}"';
       buffer.writeln(
-          '${t.title},${t.category},${_formatJalali(t.dueDate)},${t.dueTime},${t.priority},${t.recurrence}');
+          '${q(t.title)},${q(t.category)},${q(_formatJalali(t.dueDate))},${q(t.dueTime)},${q(t.priority)},${q(t.recurrence)}');
     }
-
     final dir = await getTemporaryDirectory();
     final file = File('${dir.path}/rooznegar.csv');
     await file.writeAsString(buffer.toString());
@@ -667,9 +709,19 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
   DateTime _selectedDate = DateTime.now();
   TimeOfDay _selectedTime = TimeOfDay.now();
 
+  static const List<String> _categories = ['کاری', 'شخصی', 'تحصیلی', 'سلامتی', 'سایر'];
+  static const List<String> _priorities = ['کم', 'متوسط', 'زیاد'];
+  static const List<String> _recurrences = ['بدون تکرار', 'روزانه', 'هفتگی', 'ماهانه'];
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Padding(
+    return SingleChildScrollView(
       padding: EdgeInsets.only(
         top: 24,
         left: 20,
@@ -681,14 +733,16 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Text('کار جدید',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              style:
+                  TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 14),
           TextField(
             controller: _titleController,
             autofocus: true,
             decoration: InputDecoration(
               hintText: 'عنوان کار...',
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
           ),
           const SizedBox(height: 12),
@@ -702,7 +756,8 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
                     final d = await showDatePicker(
                       context: context,
                       initialDate: _selectedDate,
-                      firstDate: DateTime.now().subtract(const Duration(days: 30)),
+                      firstDate:
+                          DateTime.now().subtract(const Duration(days: 365)),
                       lastDate: DateTime.now().add(const Duration(days: 365)),
                     );
                     if (d != null) setState(() => _selectedDate = d);
@@ -713,7 +768,8 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
               Expanded(
                 child: OutlinedButton.icon(
                   icon: const Icon(Icons.access_time, size: 18),
-                  label: Text('${_selectedTime.hour}:${_selectedTime.minute}'),
+                  label: Text(
+                      '${_selectedTime.hour.toString().padLeft(2, '0')}:${_selectedTime.minute.toString().padLeft(2, '0')}'),
                   onPressed: () async {
                     final t = await showTimePicker(
                       context: context,
@@ -726,17 +782,32 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
             ],
           ),
           const SizedBox(height: 16),
+          // ✅ اصلاح: افزودن انتخاب دسته، اولویت و تکرار که قبلاً غایب بود
+          _buildDropdownRow('دسته', _category, _categories, (v) {
+            if (v != null) setState(() => _category = v);
+          }),
+          const SizedBox(height: 10),
+          _buildDropdownRow('اولویت', _priority, _priorities, (v) {
+            if (v != null) setState(() => _priority = v);
+          }),
+          const SizedBox(height: 10),
+          _buildDropdownRow('تکرار', _recurrence, _recurrences, (v) {
+            if (v != null) setState(() => _recurrence = v);
+          }),
+          const SizedBox(height: 16),
           SizedBox(
             width: double.infinity,
             height: 48,
             child: ElevatedButton(
               style: ElevatedButton.styleFrom(
                 backgroundColor: Theme.of(context).colorScheme.primary,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
               ),
               onPressed: _save,
               child: const Text('ثبت و فعال‌سازی یادآور',
-                  style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                  style: TextStyle(
+                      color: Colors.black, fontWeight: FontWeight.bold)),
             ),
           ),
         ],
@@ -744,13 +815,49 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
     );
   }
 
-  void _save() async {
-    if (_titleController.text.trim().isEmpty) return;
+  Widget _buildDropdownRow(
+    String label,
+    String value,
+    List<String> items,
+    void Function(String?) onChanged,
+  ) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 70,
+          child: Text(label,
+              style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        ),
+        Expanded(
+          child: DropdownButtonFormField<String>(
+            value: value,
+            decoration: InputDecoration(
+              isDense: true,
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            items: items
+                .map((e) => DropdownMenuItem(value: e, child: Text(e)))
+                .toList(),
+            onChanged: onChanged,
+          ),
+        ),
+      ],
+    );
+  }
 
+  void _save() async {
+    if (_titleController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('عنوان کار نمی‌تواند خالی باشد.')),
+      );
+      return;
+    }
     final dateStr = _selectedDate.toIso8601String().substring(0, 10);
     final timeStr =
         '${_selectedTime.hour.toString().padLeft(2, '0')}:${_selectedTime.minute.toString().padLeft(2, '0')}';
-
     final task = Task(
       title: _titleController.text.trim(),
       category: _category,
@@ -759,10 +866,7 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
       priority: _priority,
       recurrence: _recurrence,
     );
-
     final id = await AppDatabase.insertTask(task);
-
-    // تنظیم آلارم دقیق محلی آفلاین
     final alarmTime = DateTime(
       _selectedDate.year,
       _selectedDate.month,
@@ -770,14 +874,12 @@ class _AddTaskSheetState extends State<AddTaskSheet> {
       _selectedTime.hour,
       _selectedTime.minute,
     );
-
     await NotificationService.scheduleAlarm(
       id: id,
       title: 'یادآوری کار: ${task.title}',
       body: 'موعد انجام کار فرا رسیده است.',
       scheduledDate: alarmTime,
     );
-
     widget.onTaskAdded();
     if (mounted) Navigator.pop(context);
   }
